@@ -633,3 +633,481 @@ fn popf_trap_flag_single_steps_one_instruction() {
     assert_eq!(*hits.borrow(), vec![(EXC_DEBUG, after_mov_ecx)]);
     assert_eq!(h.reg_read(Reg::RDX), 9);
 }
+
+
+fn cpuid(leaf: u32, sub: u32) -> core::arch::x86_64::CpuidResult {
+    core::arch::x86_64::__cpuid_count(leaf, sub)
+}
+
+fn host_is_amd() -> bool {
+    cpuid(0, 0).ebx == 0x6874_7541
+}
+
+fn run_err(code: &[u8]) -> (Hades, EmuError) {
+    let mut h = setup(code);
+    let e = h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap_err();
+    (h, e)
+}
+
+fn exc(vector: u32, rip: u64) -> EmuError {
+    EmuError::Exception { vector, rip }
+}
+
+fn ymm_mem(h: &Hades, addr: u64) -> Vec<u32> {
+    h.mem_read_vec(addr, 32).unwrap().chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()
+}
+
+#[test]
+fn far_call_and_far_return_stay_in_64bit_code() {
+    let code = assemble(|a| {
+        let mut target = a.create_label();
+        let mut end = a.create_label();
+        a.mov(rbx, DATA)?;
+        a.mov(rsi, rsp)?;
+        a.db(&[0xFF, 0x1B])?;
+        a.mov(ecx, 1)?;
+        a.jmp(end)?;
+        a.set_label(&mut target)?;
+        a.mov(rdx, rsp)?;
+        a.db(&[0xCB])?;
+        a.set_label(&mut end)?;
+        Ok(())
+    });
+    const LOW: u64 = 0x0040_0000;
+    let low = |a: u64| a - CODE + LOW;
+    let ret_ip = low(find(&code, iced_x86::Mnemonic::Mov, 2));
+    let target = low(find(&code, iced_x86::Mnemonic::Mov, 3));
+    let mut h = setup(&[]);
+    h.mem_map(LOW, 0x1000, PERM_ALL).unwrap();
+    h.mem_write(LOW, &code).unwrap();
+    let mut ptr = (target as u32).to_le_bytes().to_vec();
+    ptr.extend(0x33u16.to_le_bytes());
+    h.mem_write(DATA, &ptr).unwrap();
+    h.emu_start(LOW, LOW + code.len() as u64, None, 0).unwrap();
+    let sp0 = h.reg_read(Reg::RSI);
+    assert_eq!(h.reg_read(Reg::RCX), 1);
+    assert_eq!(h.reg_read(Reg::RDX), sp0 - 8);
+    assert_eq!(h.reg_read(Reg::RSP), sp0);
+    assert_eq!(h.reg_read(Reg::CS), 0x33);
+    let frame = h.mem_read_vec(sp0 - 8, 8).unwrap();
+    assert_eq!(u32::from_le_bytes(frame[0..4].try_into().unwrap()) as u64, ret_ip);
+    assert_eq!(u32::from_le_bytes(frame[4..8].try_into().unwrap()), 0x33);
+}
+
+#[test]
+fn far_jump_selector_checks() {
+    let code = assemble(|a| {
+        a.mov(rbx, DATA)?;
+        a.db(&[0xFF, 0x2B])?;
+        Ok(())
+    });
+    let jmp = find(&code, iced_x86::Mnemonic::Jmp, 0);
+    for sel in [0x00u16, 0x10, 0x13, 0x2B, 0x40, 0x48, 0x70, 0x37, 0x23] {
+        let mut h = setup(&code);
+        let mut ptr = (CODE as u32).to_le_bytes().to_vec();
+        ptr.extend(sel.to_le_bytes());
+        h.mem_write(DATA, &ptr).unwrap();
+        let e = h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap_err();
+        match sel {
+            0x23 => assert!(matches!(e, EmuError::Unsupported { rip: at, .. } if at == jmp), "{sel:#x}: {e:?}"),
+            _ => assert_eq!(e, exc(EXC_GENERAL_PROTECTION, jmp), "{sel:#x}"),
+        }
+        assert_eq!(h.reg_read(Reg::CS), 0x33);
+    }
+}
+
+fn iret_code(code_sel: i32, stack_sel: i32) -> Vec<u8> {
+    assemble(|a| {
+        let mut target = a.create_label();
+        a.mov(rsi, rsp)?;
+        a.push(stack_sel)?;
+        a.push(rsi)?;
+        a.pushfq()?;
+        a.or(qword_ptr(rsp), 0x801)?;
+        a.push(code_sel)?;
+        a.lea(rax, ptr(target))?;
+        a.push(rax)?;
+        a.iretq()?;
+        a.ud2()?;
+        a.set_label(&mut target)?;
+        a.setc(cl)?;
+        a.seto(dl)?;
+        Ok(())
+    })
+}
+
+#[test]
+fn iretq_restores_rip_flags_and_stack() {
+    let h = run(&iret_code(0x33, 0x2B));
+    assert_eq!(h.reg_read(Reg::RCX) & 0xff, 1);
+    assert_eq!(h.reg_read(Reg::RDX) & 0xff, 1);
+    assert_eq!(h.reg_read(Reg::RSP), h.reg_read(Reg::RSI));
+    assert_eq!(h.reg_read(Reg::SS), 0x2B);
+
+    for (code_sel, stack_sel) in [(0x33, 0), (0x33, 0x28), (0x30, 0x2B), (0x2B, 0x2B), (0x23, 0x2B)] {
+        let code = iret_code(code_sel, stack_sel);
+        let iret = find(&code, iced_x86::Mnemonic::Iretq, 0);
+        let (h, e) = run_err(&code);
+        match code_sel {
+            0x23 => assert!(matches!(e, EmuError::Unsupported { rip: at, .. } if at == iret)),
+            _ => assert_eq!(e, exc(EXC_GENERAL_PROTECTION, iret), "{code_sel:#x}:{stack_sel:#x}"),
+        }
+        assert_eq!(h.reg_read(Reg::RSP), h.reg_read(Reg::RSI) - 40);
+    }
+}
+
+#[test]
+fn segment_register_loads_and_stores() {
+    let code = assemble(|a| {
+        a.mov(rbx, DATA)?;
+        a.db(&[0x66, 0x8C, 0xE8])?;
+        a.mov(ecx, 0x53)?;
+        a.db(&[0x8E, 0xE9])?;
+        a.db(&[0x0F, 0xA0])?;
+        a.pop(rdx)?;
+        a.mov(dword_ptr(rbx), 0x11223344)?;
+        a.mov(word_ptr(rbx + 4), 0x2B)?;
+        a.db(&[0x0F, 0xB2, 0x33])?;
+        a.xor(edi, edi)?;
+        a.db(&[0x8E, 0xDF])?;
+        Ok(())
+    });
+    let mut h = setup(&code);
+    h.reg_write(Reg::GsBase, 0x5000);
+    h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap();
+    assert_eq!(h.reg_read(Reg::RAX) & 0xffff, 0x2B);
+    assert_eq!(h.reg_read(Reg::GS), 0x53);
+    assert_eq!(h.reg_read(Reg::GsBase), 0);
+    assert_eq!(h.reg_read(Reg::RDX) & 0xffff, 0x53);
+    assert_eq!(h.reg_read(Reg::RSI), 0x11223344);
+    assert_eq!(h.reg_read(Reg::SS), 0x2B);
+    assert_eq!(h.reg_read(Reg::DS), 0);
+
+    for (bytes, vector) in [
+        (vec![0xB8, 0x10, 0, 0, 0, 0x8E, 0xD8], EXC_GENERAL_PROTECTION),
+        (vec![0xB8, 0x40, 0, 0, 0, 0x8E, 0xE0], EXC_GENERAL_PROTECTION),
+        (vec![0x31, 0xC0, 0x90, 0x90, 0x90, 0x8E, 0xD0], EXC_GENERAL_PROTECTION),
+        (vec![0xB8, 0x23, 0, 0, 0, 0x8E, 0xD0], EXC_GENERAL_PROTECTION),
+        (vec![0xB8, 0x2B, 0, 0, 0, 0x8E, 0xC8], EXC_INVALID_OPCODE),
+    ] {
+        let (h, e) = run_err(&bytes);
+        assert_eq!(e, exc(vector, CODE + 5), "{bytes:x?}");
+        assert_eq!(h.reg_read(Reg::DS), 0x2B);
+        assert_eq!(h.reg_read(Reg::SS), 0x2B);
+    }
+}
+
+#[test]
+fn sixteen_bit_pushf_popf() {
+    let code = assemble(|a| {
+        a.mov(rsi, rsp)?;
+        a.stc()?;
+        a.db(&[0x66, 0x9C])?;
+        a.mov(rdi, rsp)?;
+        a.movzx(eax, word_ptr(rsp))?;
+        a.clc()?;
+        a.db(&[0x66, 0x9D])?;
+        a.setc(cl)?;
+        Ok(())
+    });
+    let h = run(&code);
+    let sp0 = h.reg_read(Reg::RSI);
+    assert_eq!(h.reg_read(Reg::RDI), sp0 - 2);
+    assert_eq!(h.reg_read(Reg::RSP), sp0);
+    assert_eq!(h.reg_read(Reg::RAX) & 0x0001, 1);
+    assert_eq!(h.reg_read(Reg::RCX) & 0xff, 1);
+
+    let code = assemble(|a| {
+        a.sub(rsp, 2)?;
+        a.mov(word_ptr(rsp), 0x0102)?;
+        a.db(&[0x66, 0x9D])?;
+        a.mov(ecx, 7)?;
+        a.mov(edx, 9)?;
+        Ok(())
+    });
+    let after = find(&code, iced_x86::Mnemonic::Mov, 2);
+    let (h, e) = run_err(&code);
+    assert_eq!(e, exc(EXC_DEBUG, after));
+    assert_eq!(h.reg_read(Reg::RCX), 7);
+    assert_eq!(h.reg_read(Reg::RDX), 0);
+}
+
+#[test]
+fn tsx_transactions_always_abort() {
+    let rtm = cpuid(7, 0).ebx >> 11 & 1 != 0;
+    let code = assemble(|a| {
+        let mut fallback = a.create_label();
+        a.mov(rax, -1i64)?;
+        a.xbegin(fallback)?;
+        a.mov(ecx, 1)?;
+        a.xend()?;
+        a.set_label(&mut fallback)?;
+        a.mov(edx, 2)?;
+        Ok(())
+    });
+    let xbegin = find(&code, iced_x86::Mnemonic::Xbegin, 0);
+    let mut h = setup(&code);
+    let r = h.emu_start(CODE, CODE + code.len() as u64, None, 0);
+    if rtm {
+        r.unwrap();
+        assert_eq!(h.reg_read(Reg::RAX), 0);
+        assert_eq!(h.reg_read(Reg::RCX), 0);
+        assert_eq!(h.reg_read(Reg::RDX), 2);
+    } else {
+        assert_eq!(r.unwrap_err(), exc(EXC_INVALID_OPCODE, xbegin));
+    }
+    let (_, e) = run_err(&[0x0F, 0x01, 0xD5]);
+    assert_eq!(e, exc(if rtm { EXC_GENERAL_PROTECTION } else { EXC_INVALID_OPCODE }, CODE));
+}
+
+#[test]
+fn system_instructions_fault_like_user_mode() {
+    let sysenter = if host_is_amd() { EXC_INVALID_OPCODE } else { EXC_GENERAL_PROTECTION };
+    for (bytes, vector) in [
+        (&[0x0F, 0x34][..], sysenter),
+        (&[0x0F, 0x35][..], EXC_GENERAL_PROTECTION),
+        (&[0x48, 0x0F, 0x07][..], EXC_GENERAL_PROTECTION),
+        (&[0x0F, 0x01, 0xC8][..], EXC_INVALID_OPCODE),
+        (&[0x0F, 0x01, 0xC9][..], EXC_INVALID_OPCODE),
+        (&[0x0F, 0x01, 0xEF][..], EXC_INVALID_OPCODE),
+        (&[0x0F, 0x01, 0xEE][..], EXC_INVALID_OPCODE),
+        (&[0xF3, 0x48, 0x0F, 0xAE, 0xE8][..], EXC_INVALID_OPCODE),
+        (&[0xF3, 0x0F, 0x01, 0xEA][..], EXC_INVALID_OPCODE),
+        (&[0xF3, 0x0F, 0x01, 0xE8][..], EXC_INVALID_OPCODE),
+        (&[0x66, 0x48, 0x0F, 0x38, 0xF5, 0x03][..], EXC_GENERAL_PROTECTION),
+        (&[0x48, 0x0F, 0xC7, 0x1B][..], EXC_GENERAL_PROTECTION),
+    ] {
+        let (_, e) = run_err(bytes);
+        assert_eq!(e, exc(vector, CODE), "{bytes:x?}");
+    }
+    let code = [0x48, 0xC7, 0xC0, 0x34, 0x12, 0, 0, 0xF3, 0x48, 0x0F, 0x1E, 0xC8, 0xF3, 0x0F, 0x1A, 0x00];
+    let h = run(&code);
+    assert_eq!(h.reg_read(Reg::RAX), 0x1234);
+}
+
+#[test]
+fn guest_xsave_and_xrstor_use_guest_memory() {
+    let code = assemble(|a| {
+        a.mov(rbx, DATA)?;
+        a.mov(rax, 0x1122_3344_5566_7788u64)?;
+        a.movq(xmm1, rax)?;
+        a.vmovdqu(ymm2, ymmword_ptr(rbx + 0x1000))?;
+        a.mov(eax, -1)?;
+        a.mov(edx, -1)?;
+        a.xsave64(ptr(rbx))?;
+        a.pxor(xmm1, xmm1)?;
+        a.vpxor(ymm2, ymm2, ymm2)?;
+        a.xrstor64(ptr(rbx))?;
+        a.movq(rcx, xmm1)?;
+        a.vmovdqu(ymmword_ptr(rbx + 0x1100), ymm2)?;
+        Ok(())
+    });
+    let mut h = setup(&code);
+    let pattern: Vec<u8> = (1..=32).collect();
+    h.mem_write(DATA + 0x1000, &pattern).unwrap();
+    h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap();
+    assert_eq!(h.reg_read(Reg::RCX), 0x1122_3344_5566_7788);
+    assert_eq!(h.mem_read_vec(DATA + 0x1100, 32).unwrap(), pattern);
+    let img = h.mem_read_vec(DATA, 1024).unwrap();
+    assert_eq!(u32::from_le_bytes(img[24..28].try_into().unwrap()), 0x1F80);
+    assert_eq!(img[160 + 16..160 + 24], 0x1122_3344_5566_7788u64.to_le_bytes());
+    assert_eq!(img[160 + 32..160 + 48], pattern[..16]);
+    assert_eq!(img[576 + 32..576 + 48], pattern[16..]);
+    assert_eq!(u64::from_le_bytes(img[512..520].try_into().unwrap()) & 6, 6);
+    assert_eq!(img[520..536], [0u8; 16]);
+
+    let misaligned = assemble(|a| {
+        a.mov(rbx, DATA + 8)?;
+        a.xsave64(ptr(rbx))?;
+        Ok(())
+    });
+    let (_, e) = run_err(&misaligned);
+    assert_eq!(e, exc(EXC_GENERAL_PROTECTION, find(&misaligned, iced_x86::Mnemonic::Xsave64, 0)));
+
+    let bad_header = assemble(|a| {
+        a.mov(rbx, DATA)?;
+        a.mov(eax, -1)?;
+        a.mov(edx, -1)?;
+        a.xrstor64(ptr(rbx))?;
+        Ok(())
+    });
+    let mut h = setup(&bad_header);
+    h.mem_write(DATA + 520, &[1]).unwrap();
+    let e = h.emu_start(CODE, CODE + bad_header.len() as u64, None, 0).unwrap_err();
+    assert_eq!(e, exc(EXC_GENERAL_PROTECTION, find(&bad_header, iced_x86::Mnemonic::Xrstor64, 0)));
+}
+
+#[test]
+fn guest_xsavec_round_trips_in_compacted_form() {
+    let code = assemble(|a| {
+        a.mov(rbx, DATA)?;
+        a.mov(rax, 0x0102_0304_0506_0708u64)?;
+        a.movq(xmm5, rax)?;
+        a.mov(eax, 7)?;
+        a.xor(edx, edx)?;
+        a.xsavec64(ptr(rbx))?;
+        a.pxor(xmm5, xmm5)?;
+        a.xrstor64(ptr(rbx))?;
+        a.movq(rcx, xmm5)?;
+        Ok(())
+    });
+    let mut h = setup(&code);
+    let r = h.emu_start(CODE, CODE + code.len() as u64, None, 0);
+    if cpuid(0xD, 1).eax >> 1 & 1 == 0 {
+        assert_eq!(r.unwrap_err(), exc(EXC_INVALID_OPCODE, find(&code, iced_x86::Mnemonic::Xsavec64, 0)));
+        return;
+    }
+    r.unwrap();
+    assert_eq!(h.reg_read(Reg::RCX), 0x0102_0304_0506_0708);
+    let hdr = h.mem_read_vec(DATA + 512, 16).unwrap();
+    assert_eq!(u64::from_le_bytes(hdr[8..16].try_into().unwrap()), 7 | 1 << 63);
+}
+
+fn gather_code() -> Vec<u8> {
+    assemble(|a| {
+        a.mov(rbx, DATA)?;
+        a.vmovdqu(ymm1, ymmword_ptr(rbx + 0x100))?;
+        a.vmovdqu(ymm2, ymmword_ptr(rbx + 0x120))?;
+        a.vmovdqu(ymm0, ymmword_ptr(rbx + 0x140))?;
+        a.vpgatherdd_3(ymm0, ptr(rbx + ymm1 * 4), ymm2)?;
+        a.vmovdqu(ymmword_ptr(rbx + 0x200), ymm0)?;
+        a.vmovdqu(ymmword_ptr(rbx + 0x220), ymm2)?;
+        Ok(())
+    })
+}
+
+fn gather_setup(code: &[u8], idx: [u32; 8]) -> Hades {
+    let mut h = setup(code);
+    let table: Vec<u8> = (0..8u32).flat_map(|k| (100 + k).to_le_bytes()).collect();
+    h.mem_write(DATA, &table).unwrap();
+    h.mem_write(DATA + 0x100, &idx.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+    let mask: Vec<u8> = (0..8).flat_map(|k: u32| if k == 3 { 0u32 } else { 0x8000_0000u32 }.to_le_bytes()).collect();
+    h.mem_write(DATA + 0x120, &mask).unwrap();
+    h.mem_write(DATA + 0x140, &[0xEE; 32]).unwrap();
+    h
+}
+
+#[test]
+fn avx2_gather_merges_masked_lanes_and_faults_precisely() {
+    let code = gather_code();
+    let mut h = gather_setup(&code, [0, 2, 4, 6, 1, 3, 5, 7]);
+    h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap();
+    assert_eq!(ymm_mem(&h, DATA + 0x200), vec![100, 102, 104, 0xEEEE_EEEE, 101, 103, 105, 107]);
+    assert_eq!(ymm_mem(&h, DATA + 0x220), vec![0; 8]);
+
+    let gather = find(&code, iced_x86::Mnemonic::Vpgatherdd, 0);
+    let mut h = gather_setup(&code, [0, 2, 0x4000, 6, 1, 3, 5, 7]);
+    let e = h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap_err();
+    assert!(matches!(e, EmuError::Memory { addr, rip: at, .. } if addr == DATA + 0x10000 && at == gather), "{e:?}");
+    let lanes = |v: u128| (0..4).map(|k| (v >> (32 * k)) as u32).collect::<Vec<_>>();
+    assert_eq!(lanes(h.xmm_read(0)), vec![100, 102, 0xEEEE_EEEE, 0xEEEE_EEEE]);
+    assert_eq!(lanes(h.xmm_read(2)), vec![0, 0, 0x8000_0000, 0]);
+}
+
+#[test]
+fn avx512_gather_and_scatter_follow_opmask() {
+    let code = assemble(|a| {
+        a.mov(rbx, DATA)?;
+        a.vmovdqu32(zmm1, zmmword_ptr(rbx + 0x100))?;
+        a.vmovdqu32(zmm2, zmmword_ptr(rbx + 0x140))?;
+        a.mov(eax, 0xFFF7)?;
+        a.kmovw(k1, eax)?;
+        a.vpgatherdd(zmm2.k1(), ptr(rbx + zmm1 * 4))?;
+        a.kmovw(ecx, k1)?;
+        a.vmovdqu32(zmmword_ptr(rbx + 0x200), zmm2)?;
+        a.mov(eax, 0x0005)?;
+        a.kmovw(k2, eax)?;
+        a.vpscatterdd(ptr(rbx + 0x400 + zmm1 * 4).k2(), zmm2)?;
+        Ok(())
+    });
+    let mut h = setup(&code);
+    let table: Vec<u8> = (0..16u32).flat_map(|k| (100 + k).to_le_bytes()).collect();
+    h.mem_write(DATA, &table).unwrap();
+    let idx: Vec<u8> = (0..16u32).flat_map(|k| (15 - k).to_le_bytes()).collect();
+    h.mem_write(DATA + 0x100, &idx).unwrap();
+    h.mem_write(DATA + 0x140, &[0xEE; 64]).unwrap();
+    let r = h.emu_start(CODE, CODE + code.len() as u64, None, 0);
+    if cpuid(7, 0).ebx >> 16 & 1 == 0 {
+        assert_eq!(r.unwrap_err(), exc(EXC_INVALID_OPCODE, find(&code, iced_x86::Mnemonic::Vmovdqu32, 0)));
+        return;
+    }
+    r.unwrap();
+    let out: Vec<u32> = h.mem_read_vec(DATA + 0x200, 64).unwrap().chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let want: Vec<u32> = (0..16u32).map(|k| if k == 3 { 0xEEEE_EEEE } else { 115 - k }).collect();
+    assert_eq!(out, want);
+    assert_eq!(h.reg_read(Reg::RCX), 0);
+    let sc = h.mem_read_vec(DATA + 0x400, 64).unwrap();
+    assert_eq!(u32::from_le_bytes(sc[60..64].try_into().unwrap()), 115);
+    assert_eq!(u32::from_le_bytes(sc[52..56].try_into().unwrap()), 113);
+    assert_eq!(sc[0..52], [0u8; 52]);
+}
+
+#[test]
+fn maskmov_stores_selected_bytes_at_rdi() {
+    let code = assemble(|a| {
+        a.mov(rbx, DATA)?;
+        a.lea(rdi, ptr(rbx + 0x300))?;
+        a.movdqu(xmm0, xmmword_ptr(rbx))?;
+        a.movdqu(xmm1, xmmword_ptr(rbx + 0x10))?;
+        a.maskmovdqu(xmm0, xmm1)?;
+        a.lea(rdi, ptr(rbx + 0x380))?;
+        a.movq(mm0, qword_ptr(rbx))?;
+        a.movq(mm1, qword_ptr(rbx + 0x18))?;
+        a.maskmovq(mm0, mm1)?;
+        a.emms()?;
+        Ok(())
+    });
+    let mut h = setup(&code);
+    let data: Vec<u8> = (0x10..0x20).collect();
+    let mask: Vec<u8> = (0..16).map(|k| if k % 2 == 0 { 0x80 } else { 0x7F }).collect();
+    h.mem_write(DATA, &data).unwrap();
+    h.mem_write(DATA + 0x10, &mask).unwrap();
+    h.mem_write(DATA + 0x300, &[0xAA; 16]).unwrap();
+    h.mem_write(DATA + 0x380, &[0xAA; 8]).unwrap();
+    h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap();
+    let want: Vec<u8> = (0..16).map(|k| if k % 2 == 0 { 0x10 + k as u8 } else { 0xAA }).collect();
+    assert_eq!(h.mem_read_vec(DATA + 0x300, 16).unwrap(), want);
+    assert_eq!(h.mem_read_vec(DATA + 0x380, 8).unwrap(), want[..8]);
+}
+
+#[test]
+fn register_addressed_stores_use_guest_memory() {
+    let movdir64b = cpuid(7, 0).ecx >> 28 & 1 != 0;
+    let code = assemble(|a| {
+        a.mov(rbx, DATA)?;
+        a.lea(rcx, ptr(rbx + 0x500))?;
+        a.movdir64b(rcx, ptr(rbx))?;
+        a.lea(rcx, ptr(rbx + 0x5C8))?;
+        a.movdir64b(rcx, ptr(rbx))?;
+        Ok(())
+    });
+    let mut h = setup(&code);
+    let src: Vec<u8> = (0..64).collect();
+    h.mem_write(DATA, &src).unwrap();
+    let e = h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap_err();
+    if movdir64b {
+        assert_eq!(h.mem_read_vec(DATA + 0x500, 64).unwrap(), src);
+        assert_eq!(e, exc(EXC_GENERAL_PROTECTION, find(&code, iced_x86::Mnemonic::Movdir64b, 1)));
+    } else {
+        assert_eq!(e, exc(EXC_INVALID_OPCODE, find(&code, iced_x86::Mnemonic::Movdir64b, 0)));
+    }
+
+    let clzero = cpuid(0x8000_0008, 0).ebx & 1 != 0;
+    let code = assemble(|a| {
+        a.mov(rax, DATA + 0x610)?;
+        a.clzero()?;
+        Ok(())
+    });
+    let mut h = setup(&code);
+    h.mem_write(DATA + 0x5C0, &[0xAA; 0x100]).unwrap();
+    let r = h.emu_start(CODE, CODE + code.len() as u64, None, 0);
+    if clzero {
+        r.unwrap();
+        let m = h.mem_read_vec(DATA + 0x5C0, 0x100).unwrap();
+        assert_eq!(m[..0x40], [0xAA; 0x40]);
+        assert_eq!(m[0x40..0x80], [0; 0x40]);
+        assert_eq!(m[0x80..], [0xAA; 0x80]);
+    } else {
+        assert_eq!(r.unwrap_err(), exc(EXC_INVALID_OPCODE, find(&code, iced_x86::Mnemonic::Clzero, 0)));
+    }
+}

@@ -35,6 +35,13 @@ pub const KIND_MEMR: u64 = 4;
 pub const KIND_MEMW: u64 = 5;
 pub const KIND_INTERP: u64 = 6;
 
+pub const SEG_ES: usize = 0;
+pub const SEG_CS: usize = 1;
+pub const SEG_SS: usize = 2;
+pub const SEG_DS: usize = 3;
+pub const SEG_FS: usize = 4;
+pub const SEG_GS: usize = 5;
+
 pub const ACC_R: u64 = 1;
 pub const ACC_W: u64 = 2;
 pub const ACC_RW: u64 = 3;
@@ -71,6 +78,7 @@ pub struct CpuState {
     pub ind_target: u64,
     pub host_fcw: u64,
     pub ext_light: u64,
+    pub seg: [u64; 6],
     pub xsave: XsaveArea,
 }
 

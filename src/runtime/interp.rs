@@ -5,6 +5,19 @@ use crate::hooks::{HOOK_MEM_READ, HOOK_MEM_WRITE, HookCb};
 use crate::{Emu, MemAccess};
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
+pub(crate) enum IErr {
+    Fault,
+    Exc(u32),
+    Unsupported,
+}
+
+pub(crate) enum Done {
+    Next,
+    Jump(u64),
+}
+
+pub(crate) type R<T = ()> = Result<T, IErr>;
+
 const RSI: usize = 6;
 const RDI: usize = 7;
 const RBP: usize = 5;
@@ -18,17 +31,17 @@ const F_SF: u64 = 0x80;
 const F_DF: u64 = 0x400;
 const F_OF: u64 = 0x800;
 
-fn mask(size: u64) -> u64 {
+pub(super) fn mask(size: u64) -> u64 {
     if size >= 8 { u64::MAX } else { (1u64 << (size * 8)) - 1 }
 }
 
-fn reg(emu: &Emu, r: Register) -> u64 {
+pub(super) fn reg(emu: &Emu, r: Register) -> u64 {
     let Some(i) = gpr_idx(r) else { return 0 };
     let v = emu.st().gpr[i];
     if is_high8(r) { (v >> 8) & 0xff } else { v & mask(r.size() as u64) }
 }
 
-fn seg_base(emu: &Emu, i: &Instruction) -> u64 {
+pub(super) fn seg_base(emu: &Emu, i: &Instruction) -> u64 {
     match i.segment_prefix() {
         Register::FS => emu.st().fs_base,
         Register::GS => emu.st().gs_base,
@@ -36,7 +49,7 @@ fn seg_base(emu: &Emu, i: &Instruction) -> u64 {
     }
 }
 
-fn ea(emu: &Emu, i: &Instruction) -> u64 {
+pub(super) fn ea(emu: &Emu, i: &Instruction) -> u64 {
     let m = MemDesc::of(i);
     let mut a = match m.absolute {
         Some(abs) => abs,
@@ -50,21 +63,21 @@ fn ea(emu: &Emu, i: &Instruction) -> u64 {
     a.wrapping_add(seg_base(emu, i))
 }
 
-struct Mem {
-    r_hooks: bool,
-    w_hooks: bool,
+pub(super) struct Mem {
+    pub r_hooks: bool,
+    pub w_hooks: bool,
 }
 
 impl Mem {
-    fn new(emu: &Emu) -> Self {
+    pub fn new(emu: &Emu) -> Self {
         Self {
             r_hooks: emu.has_hook(|s| matches!(&s.cb, Some(HookCb::Mem(m, _)) if m & HOOK_MEM_READ != 0)),
             w_hooks: emu.has_hook(|s| matches!(&s.cb, Some(HookCb::Mem(m, _)) if m & HOOK_MEM_WRITE != 0)),
         }
     }
 
-    fn read(&self, emu: &mut Emu, addr: u64, size: u64, acc: u64) -> Result<u64, ()> {
-        let p = emu.access_or_fault(addr, size, acc).ok_or(())?;
+    pub fn read(&self, emu: &mut Emu, addr: u64, size: u64, acc: u64) -> R<u64> {
+        let p = emu.access_or_fault(addr, size, acc).ok_or(IErr::Fault)?;
         let mut b = [0u8; 8];
         unsafe { core::ptr::copy_nonoverlapping(p, b.as_mut_ptr(), size as usize) };
         let v = u64::from_le_bytes(b);
@@ -74,14 +87,68 @@ impl Mem {
         Ok(v)
     }
 
-    fn write(&self, emu: &mut Emu, addr: u64, size: u64, v: u64) -> Result<(), ()> {
-        let p = emu.access_or_fault(addr, size, ACC_W).ok_or(())?;
+    pub fn write(&self, emu: &mut Emu, addr: u64, size: u64, v: u64) -> R {
+        let p = emu.access_or_fault(addr, size, ACC_W).ok_or(IErr::Fault)?;
         unsafe { core::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), p, size as usize) };
         if self.w_hooks {
             emu.mem_hooks(MemAccess::Write, addr, size as usize, v);
         }
         Ok(())
     }
+
+    pub fn read_bytes(&self, emu: &mut Emu, addr: u64, len: usize, acc: u64) -> R<Vec<u8>> {
+        let mut v = vec![0u8; len];
+        for (a, off, n) in chunks(addr, len) {
+            let p = emu.access_or_fault(a, n as u64, acc).ok_or(IErr::Fault)?;
+            unsafe { core::ptr::copy_nonoverlapping(p, v[off..].as_mut_ptr(), n) };
+        }
+        if self.r_hooks {
+            emu.mem_hooks(MemAccess::Read, addr, len, head(&v));
+        }
+        Ok(v)
+    }
+
+    pub fn probe_w(&self, emu: &mut Emu, addr: u64, len: usize) -> R {
+        for (a, _, n) in chunks(addr, len) {
+            emu.access_or_fault(a, n as u64, ACC_W).ok_or(IErr::Fault)?;
+        }
+        Ok(())
+    }
+
+    pub fn write_bytes(&self, emu: &mut Emu, addr: u64, data: &[u8]) -> R {
+        let mut ptrs = Vec::new();
+        for (a, off, n) in chunks(addr, data.len()) {
+            ptrs.push((emu.access_or_fault(a, n as u64, ACC_W).ok_or(IErr::Fault)?, off, n));
+        }
+        for (p, off, n) in ptrs {
+            unsafe { core::ptr::copy_nonoverlapping(data[off..].as_ptr(), p, n) };
+        }
+        if self.w_hooks {
+            emu.mem_hooks(MemAccess::Write, addr, data.len(), head(data));
+        }
+        Ok(())
+    }
+}
+
+fn head(b: &[u8]) -> u64 {
+    let mut h = [0u8; 8];
+    let n = b.len().min(8);
+    h[..n].copy_from_slice(&b[..n]);
+    u64::from_le_bytes(h)
+}
+
+fn chunks(addr: u64, len: usize) -> impl Iterator<Item = (u64, usize, usize)> {
+    let mut off = 0usize;
+    core::iter::from_fn(move || {
+        if off >= len {
+            return None;
+        }
+        let a = addr.wrapping_add(off as u64);
+        let n = ((crate::memory::PAGE - (a & (crate::memory::PAGE - 1))) as usize).min(len - off);
+        let r = (a, off, n);
+        off += n;
+        Some(r)
+    })
 }
 
 fn set_sub_flags(emu: &mut Emu, a: u64, b: u64, size: u64) {
@@ -148,7 +215,7 @@ fn string_op(i: &Instruction) -> Option<(SOp, u64)> {
     })
 }
 
-fn bulk(emu: &mut Emu, op: SOp, sz: u64, seg: u64) -> Result<bool, ()> {
+fn bulk(emu: &mut Emu, op: SOp, sz: u64, seg: u64) -> R<bool> {
     let st = emu.st_mut();
     let (count, rsi, rdi) = (st.gpr[RCX], st.gpr[RSI], st.gpr[RDI]);
     let src = seg.wrapping_add(rsi);
@@ -160,8 +227,8 @@ fn bulk(emu: &mut Emu, op: SOp, sz: u64, seg: u64) -> Result<bool, ()> {
         return Ok(false);
     }
     let bytes = chunk * sz;
-    let ps = if op == SOp::Movs { Some(emu.access_or_fault(src, bytes, ACC_R).ok_or(())?) } else { None };
-    let pd = emu.access_or_fault(rdi, bytes, ACC_W).ok_or(())?;
+    let ps = if op == SOp::Movs { Some(emu.access_or_fault(src, bytes, ACC_R).ok_or(IErr::Fault)?) } else { None };
+    let pd = emu.access_or_fault(rdi, bytes, ACC_W).ok_or(IErr::Fault)?;
     unsafe {
         match ps {
             Some(ps) if rdi > src && rdi < src + bytes => {
@@ -194,7 +261,7 @@ fn bulk(emu: &mut Emu, op: SOp, sz: u64, seg: u64) -> Result<bool, ()> {
     Ok(true)
 }
 
-fn string(emu: &mut Emu, i: &Instruction, op: SOp, sz: u64) -> Result<(), ()> {
+fn string(emu: &mut Emu, i: &Instruction, op: SOp, sz: u64) -> R {
     let mm = Mem::new(emu);
     let addr32 = (0..i.op_count()).any(|k| matches!(i.op_kind(k), OpKind::MemorySegESI | OpKind::MemoryESEDI));
     let amask = if addr32 { 0xffff_ffff } else { u64::MAX };
@@ -267,7 +334,7 @@ fn string(emu: &mut Emu, i: &Instruction, op: SOp, sz: u64) -> Result<(), ()> {
     Ok(())
 }
 
-fn enter(emu: &mut Emu, i: &Instruction) -> Result<(), ()> {
+fn enter(emu: &mut Emu, i: &Instruction) -> R {
     let mm = Mem::new(emu);
     let size = i.immediate16() as u64;
     let level = (i.immediate8_2nd() & 31) as u64;
@@ -292,7 +359,7 @@ fn enter(emu: &mut Emu, i: &Instruction) -> Result<(), ()> {
     Ok(())
 }
 
-fn bit_test(emu: &mut Emu, i: &Instruction) -> Result<(), ()> {
+fn bit_test(emu: &mut Emu, i: &Instruction) -> R {
     let mm = Mem::new(emu);
     let opsize = i.memory_size().size() as u64;
     let bits = opsize * 8;
@@ -320,7 +387,7 @@ fn bit_test(emu: &mut Emu, i: &Instruction) -> Result<(), ()> {
     Ok(())
 }
 
-fn xlat(emu: &mut Emu, i: &Instruction) -> Result<(), ()> {
+fn xlat(emu: &mut Emu, i: &Instruction) -> R {
     let mm = Mem::new(emu);
     let addr = ea(emu, i);
     let v = mm.read(emu, addr, 1, ACC_R)?;
@@ -329,16 +396,30 @@ fn xlat(emu: &mut Emu, i: &Instruction) -> Result<(), ()> {
     Ok(())
 }
 
-pub(crate) fn exec(emu: &mut Emu, i: &Instruction) -> Result<(), ()> {
+pub(crate) fn exec(emu: &mut Emu, i: &Instruction) -> R<Done> {
+    use Mnemonic as M;
     if let Some((op, sz)) = string_op(i)
         && i.is_string_instruction()
     {
-        return string(emu, i, op, sz);
+        string(emu, i, op, sz)?;
+        return Ok(Done::Next);
     }
     match i.mnemonic() {
-        Mnemonic::Enter => enter(emu, i),
-        Mnemonic::Xlatb => xlat(emu, i),
-        Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => bit_test(emu, i),
-        m => unreachable!("interp: {m:?}"),
+        M::Enter => enter(emu, i)?,
+        M::Xlatb => xlat(emu, i)?,
+        M::Bt | M::Bts | M::Btr | M::Btc => bit_test(emu, i)?,
+        M::Retf | M::Iret | M::Iretd | M::Iretq => return super::interp_seg::far_return(emu, i),
+        M::Jmp | M::Call => return super::interp_seg::far_jmp_call(emu, i),
+        M::Mov | M::Push | M::Pop | M::Lfs | M::Lgs | M::Lss => super::interp_seg::seg_op(emu, i)?,
+        M::Pushf | M::Popf => super::interp_seg::flags16(emu, i)?,
+        M::Xsave | M::Xsave64 | M::Xsaveopt | M::Xsaveopt64 | M::Xsavec | M::Xsavec64 => super::interp_vec::xsave(emu, i)?,
+        M::Xrstor | M::Xrstor64 => super::interp_vec::xrstor(emu, i)?,
+        M::Maskmovq | M::Maskmovdqu | M::Vmaskmovdqu => super::interp_vec::maskmov(emu, i)?,
+        M::Movdir64b => super::interp_vec::movdir64b(emu, i)?,
+        M::Clzero => super::interp_vec::clzero(emu, i)?,
+        M::Umonitor | M::Monitorx => super::interp_vec::monitor_probe(emu, i)?,
+        _ if i.is_vsib() => super::interp_vec::gather_scatter(emu, i)?,
+        _ => return Err(IErr::Unsupported),
     }
+    Ok(Done::Next)
 }

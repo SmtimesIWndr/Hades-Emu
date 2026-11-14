@@ -80,6 +80,7 @@ src/
   lib.rs              public re-exports
   emu.rs              Hades / Emu API: memory, registers, control
   error.rs            EmuError, MemAccess
+  cpu.rs              host CPU features
   hooks.rs            hook registry and add_*_hook API
   memory.rs           guest memory regions and permissions
   jit/
@@ -94,6 +95,9 @@ src/
     state.rs          CpuState layout shared with generated code
     region.rs         executable region allocation
     interp.rs         string ops, xlat, enter, bt* with memory
+    interp_seg.rs     segment loads, far jmp/call/ret, iret, 16 bit pushf/popf
+    interp_vec.rs     guest xsave/xrstor, gathers and scatters, maskmov, movdir64b, clzero
+    xstate.rs         guest vector registers inside the saved XSAVE area
     veh.rs            host fault -> guest exception
 tests/                integration tests
 examples/             bench (vs Unicorn), difftest (fuzzer), pe_run (Windows PE harness)
@@ -109,11 +113,11 @@ tools/                Unicorn counterparts and comparison scripts (Python, needs
 - **Hooks are compiled in.** Code, block and memory hooks generate calls only where they apply. Callbacks run through one trampoline. While the guest's AVX/AVX-512 state is still in init state, it saves XMM0–15 and MXCSR directly, otherwise it uses XSAVEOPT.
 - **Self modifying code.** Pages holding translated code never get a write TLB entry. A write to them invalidates the overlapping blocks. If the current block is invalidated, its code is cut right after the current instruction.
 - **Precise exceptions.** Host faults raised by natively executed guest instructions go through a vectored exception handler. It rebuilds exact guest state (including scratch registers spilled at that point) and returns `Exception { vector, rip }` or calls interrupt hooks.
-- **Interpreter fallback.** String instructions (with page chunked fast paths for `rep movs`/`rep stos`), `xlat`, `enter`, and `bt*` with a memory operand and register bit offset run in Rust.
+- **Interpreter fallback.** String instructions (with page chunked fast paths for `rep movs`/`rep stos`), `xlat`, `enter`, `bt*` with a memory operand and register bit offset, segment loads, far jumps, calls and returns, `iret`, guest `xsave`/`xrstor`, VSIB gathers and scatters, `maskmovdqu`/`maskmovq`, `movdir64b` and `clzero` run in Rust.
 
 ## Verification
 
-- `cargo test`: 26 integration tests covering semantics, hooks, faults, SMC, `until`/count/timeout, TF single stepping and vector-state preservation.
+- `cargo test`: 39 integration tests covering semantics, hooks, faults, SMC, `until`/count/timeout, TF single stepping, vector-state preservation and system instructions.
 
 - Differential fuzzing against Unicorn, random programs exercising ALU ops, shifts, mul, `lea` with RSP/R15, high byte registers, `xchg`/`xadd`/`cmpxchg`, `setcc`/`cmovcc`, `bt*`, push/pop (including memory forms), `pushfq`/`popfq`, `lahf`/`sahf`, string ops with `std`, forward `jcc`, `call`/`ret`, RIP relative, FS relative and 32 bit addressing, and SSE. The generator tracks architecturally defined flags so it never compares undefined bits. 26,000 programs matched across three codegen modes
 
@@ -127,13 +131,12 @@ tools/                Unicorn counterparts and comparison scripts (Python, needs
 
 - Host must be Windows x64 with XSAVE. The guest is 64 bit user mode only.
 - `cpuid`, `rdtsc` and `rdrand` return host values, and guest AVX 512 works only if the host has it.
-- Not emulated (yet) these return `EmuError::Unsupported`:
-  - far `jmp`/`call`/`ret`, `iret`, `sysenter`/`sysexit`/`sysret`
-  - segment register loads, and `pushf`/`popf` with 16 bit operand size
-  - the guest XSAVE family
-  - CET shadow stack instructions, `wrpkru`, TSX `xbegin`/`xabort`/`xend`, `monitor`/`mwait`
-  - VSIB gathers scatters, and instructions with implicit `[rdi]`-style operands other than string ops (`maskmovdqu`, `movdir64b`)
-- Privileged instructions raise `#GP`. TF and AC are never loaded into the host. A `popfq` that sets TF single steps like hardware. The next instruction executes, then `#DB` (vector 1, `EXC_DEBUG`) is raised with RIP after it.
+- Segments follow the Windows x64 GDT. CS is `0x33`, data is `0x2B`, FS is `0x53` and 32 bit code is `0x23`. Bad selectors raise `#GP` like hardware. Far transfers into 32 bit code (Heaven's Gate) return `EmuError::Unsupported`.
+- `sysenter`/`sysexit`/`sysret`, `monitor`/`mwait`, CET shadow stack instructions, `rdpkru`/`wrpkru` and TSX raise the same exception they raise in Windows user mode on the host. `rdssp` and MPX instructions are NOPs. If the host has RTM, `xbegin` always aborts with RAX = 0.
+- Behavior that differs between Intel and AMD follows the host CPU.
+- Guest `xsave`/`xrstor` cover x87, SSE, AVX and AVX 512. AMX instructions on hosts with AMX return `EmuError::Unsupported`.
+- x87 FIP/FDP/FOP are host values.
+- Privileged instructions raise `#GP`. TF and AC are never loaded into the host. A `popfq`, 16 bit `popf` or `iret` that sets TF single steps like hardware. The next instruction executes, then `#DB` (vector 1, `EXC_DEBUG`) is raised with RIP after it.
 - When a memory access faults while the guest's arithmetic flags are dead (overwritten before being read), the flag bits in the reported state are unspecified. Resuming is unaffected. `div`/`idiv` always keep precise flags.
 - Hooks added or removed from inside a callback take effect at the next backward branch or indirect jump. `emu_stop()` from a code hook stops before the hooked instruction.
 - Memory read hooks fire before the access and receive the current memory value. Write hooks fire after the access and receive the written value.

@@ -1,8 +1,11 @@
 pub mod interp;
+mod interp_seg;
+mod interp_vec;
 pub mod region;
 pub mod state;
 mod trampolines;
 pub mod veh;
+mod xstate;
 
 use crate::hooks::HookCb;
 use crate::jit::asm::{Asm, AsmError, patch_rel32};
@@ -55,9 +58,10 @@ impl Emu {
         st.dispatch_fn = dispatch_entry as *const () as u64;
         st.rflags = 0x202;
         st.run_flag = 1;
+        st.seg = [0x2B, 0x33, 0x2B, 0x2B, 0x53, 0x2B];
         let x = &mut st.xsave.0;
         x[24..28].copy_from_slice(&0x1F80u32.to_le_bytes());
-        x[28..32].copy_from_slice(&0xFFFFu32.to_le_bytes());
+        x[28..32].copy_from_slice(&crate::cpu::cpu().mxcsr_mask.to_le_bytes());
         x[0..2].copy_from_slice(&0x037Fu16.to_le_bytes());
         emu.tlb_flush();
         emu.jit.jc_clear();
@@ -285,11 +289,30 @@ impl Emu {
             }
             KIND_INTERP => {
                 let insn = self.jit.interp[ea as usize];
-                if interp::exec(self, &insn).is_err() {
-                    self.st_mut().exit_reason = EXIT_HELPER;
+                let next = match interp::exec(self, &insn) {
+                    Ok(interp::Done::Next) => insn.next_ip(),
+                    Ok(interp::Done::Jump(t)) => t,
+                    Err(e) => {
+                        let st = self.st_mut();
+                        st.rip = insn.ip();
+                        st.exit_reason = match e {
+                            interp::IErr::Fault => EXIT_HELPER,
+                            interp::IErr::Exc(v) => {
+                                st.exit_aux = v as u64;
+                                EXIT_EXCEPTION
+                            }
+                            interp::IErr::Unsupported => EXIT_UNSUPPORTED,
+                        };
+                        return 1;
+                    }
+                };
+                let st = self.st_mut();
+                st.rip = next;
+                if st.rflags & 0x100 != 0 {
+                    st.rflags &= !0x100;
+                    st.exit_reason = EXIT_TRAP_PENDING;
                     return 1;
                 }
-                self.st_mut().rip = insn.next_ip();
                 self.after_callback(block, insn.next_ip())
             }
             _ => unreachable!("bad dispatch kind {kind}"),

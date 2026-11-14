@@ -1,6 +1,7 @@
 #[cfg(not(all(windows, target_arch = "x86_64")))]
 compile_error!("hades-emu requires a Windows x86-64 host");
 
+mod cpu;
 mod emu;
 mod error;
 mod hooks;

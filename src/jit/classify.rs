@@ -1,8 +1,9 @@
 use super::ARITH;
+use crate::cpu::{Vendor, cpu};
 use crate::{EXC_GENERAL_PROTECTION, EXC_INVALID_OPCODE};
 use crate::jit::regs::*;
 use crate::runtime::state::*;
-use iced_x86::{Code, FlowControl, Instruction, InstructionInfoFactory, MemorySize, Mnemonic, OpAccess, OpKind, Register};
+use iced_x86::{Code, CpuidFeature, FlowControl, Instruction, InstructionInfoFactory, MemorySize, Mnemonic, OpAccess, OpKind, Register};
 
 #[derive(Clone, Copy, Debug)]
 pub enum Kind {
@@ -14,6 +15,8 @@ pub enum Kind {
     Popfq,
     Leave,
     Interp,
+    InterpEnd,
+    TxAbort(u64),
     RdBase(usize),
     WrBase(usize),
     Jmp(u64),
@@ -40,6 +43,8 @@ impl Kind {
                 | Kind::CallIndirect
                 | Kind::JmpIndirect
                 | Kind::Ret(_)
+                | Kind::InterpEnd
+                | Kind::TxAbort(_)
                 | Kind::Syscall
                 | Kind::Interrupt(_)
                 | Kind::Exception(_)
@@ -73,8 +78,58 @@ pub(super) fn mem_op_index(i: &Instruction) -> Option<u32> {
     (0..i.op_count()).find(|&op| i.op_kind(op) == OpKind::Memory)
 }
 
+fn special(i: &Instruction) -> Option<Kind> {
+    use Mnemonic as M;
+    let c = cpu();
+    let ud = Kind::Exception(EXC_INVALID_OPCODE);
+    let gp = Kind::Exception(EXC_GENERAL_PROTECTION);
+    let feats = i.cpuid_features();
+    if feats.contains(&CpuidFeature::MPX) {
+        return Some(Kind::Skip);
+    }
+    if feats.iter().any(|f| {
+        matches!(
+            f,
+            CpuidFeature::AMX_TILE | CpuidFeature::AMX_INT8 | CpuidFeature::AMX_BF16 | CpuidFeature::AMX_FP16 | CpuidFeature::AMX_COMPLEX
+        )
+    }) {
+        return Some(if c.amx_tile { Kind::Unsupported } else { ud });
+    }
+    Some(match i.mnemonic() {
+        M::Xbegin => if c.rtm { Kind::TxAbort(i.near_branch_target()) } else { ud },
+        M::Xend => if c.rtm { gp } else { ud },
+        M::Xabort => if c.rtm { Kind::Skip } else { ud },
+        M::Rdsspd | M::Rdsspq => Kind::Skip,
+        M::Incsspd | M::Incsspq | M::Saveprevssp | M::Rstorssp | M::Wrssd | M::Wrssq | M::Setssbsy | M::Clrssbsy
+        | M::Jmpe => ud,
+        M::Wrussd | M::Wrussq | M::Sysret | M::Sysexit | M::Xsaves | M::Xsaves64 | M::Xrstors | M::Xrstors64 => gp,
+        M::Rdpkru | M::Wrpkru => if c.ospke { Kind::Unsupported } else { ud },
+        M::Monitor | M::Mwait => ud,
+        M::Sysenter => if c.vendor == Vendor::Amd { ud } else { gp },
+        M::Enqcmd => if c.enqcmd { gp } else { ud },
+        M::Jmp | M::Call if is_far_mem(i) => Kind::InterpEnd,
+        M::Retf | M::Iret | M::Iretd | M::Iretq => Kind::InterpEnd,
+        M::Push | M::Pop if i.op_kind(0) == OpKind::Register && i.op0_register().is_segment_register() => Kind::Interp,
+        M::Mov if (0..2).any(|k| i.op_kind(k) == OpKind::Register && i.op_register(k).is_segment_register()) => {
+            Kind::Interp
+        }
+        M::Pushf | M::Popf | M::Lfs | M::Lgs | M::Lss => Kind::Interp,
+        M::Xsave | M::Xsave64 | M::Xsaveopt | M::Xsaveopt64 | M::Xsavec | M::Xsavec64 | M::Xrstor | M::Xrstor64 => {
+            Kind::Interp
+        }
+        M::Maskmovq | M::Maskmovdqu | M::Vmaskmovdqu | M::Movdir64b | M::Clzero | M::Umonitor | M::Monitorx => {
+            Kind::Interp
+        }
+        _ if i.is_vsib() => Kind::Interp,
+        _ => return None,
+    })
+}
+
 pub fn classify(i: &Instruction, f: &mut InstructionInfoFactory) -> Kind {
     use Mnemonic as M;
+    if let Some(k) = special(i) {
+        return k;
+    }
     if i.code().is_privileged() {
         return Kind::Exception(EXC_GENERAL_PROTECTION);
     }
@@ -127,16 +182,9 @@ pub fn classify(i: &Instruction, f: &mut InstructionInfoFactory) -> Kind {
         M::Rdgsbase => Kind::RdBase(OFF_GS),
         M::Wrfsbase => Kind::WrBase(OFF_FS),
         M::Wrgsbase => Kind::WrBase(OFF_GS),
-        M::Incsspd | M::Incsspq | M::Rdsspd | M::Rdsspq | M::Saveprevssp | M::Rstorssp | M::Wrssd | M::Wrssq
-        | M::Wrussd | M::Wrussq | M::Setssbsy | M::Clrssbsy | M::Wrpkru | M::Xsave | M::Xsave64 | M::Xsaveopt
-        | M::Xsaveopt64 | M::Xsavec | M::Xsavec64 | M::Xsaves | M::Xsaves64 | M::Xrstor | M::Xrstor64 | M::Xrstors
-        | M::Xrstors64 | M::Lfs | M::Lgs | M::Lss | M::Monitor | M::Monitorx | M::Sysenter | M::Sysexit
-        | M::Sysret | M::Iret | M::Iretd | M::Iretq | M::Retf | M::Into | M::Jmpe | M::Xbegin | M::Xabort
-        | M::Xend => Kind::Unsupported,
-        M::Mov if k0 == OpKind::Register && i.op0_register().is_segment_register() => Kind::Unsupported,
         _ if i.is_string_instruction() => Kind::Interp,
         _ => {
-            if i.is_stack_instruction() || i.flow_control() != FlowControl::Next || i.is_vsib() || has_special_mem(i) {
+            if i.is_stack_instruction() || i.flow_control() != FlowControl::Next || has_special_mem(i) {
                 Kind::Unsupported
             } else if let Some(op) = mem_op_index(i) {
                 let acc = f.info(i).op_access(op);

@@ -23,6 +23,7 @@ pub enum Reg {
     RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI,
     R8, R9, R10, R11, R12, R13, R14, R15,
     RIP, RFLAGS, FsBase, GsBase,
+    ES, CS, SS, DS, FS, GS,
 }
 
 impl Reg {
@@ -150,6 +151,7 @@ impl Emu {
             Reg::RFLAGS => st.rflags,
             Reg::FsBase => st.fs_base,
             Reg::GsBase => st.gs_base,
+            Reg::ES | Reg::CS | Reg::SS | Reg::DS | Reg::FS | Reg::GS => st.seg[r as usize - Reg::ES as usize],
             _ => st.gpr[r as usize],
         }
     }
@@ -161,6 +163,7 @@ impl Emu {
             Reg::RFLAGS => st.rflags = (v & 0x200CD5) | 0x202,
             Reg::FsBase => st.fs_base = v,
             Reg::GsBase => st.gs_base = v,
+            Reg::ES | Reg::CS | Reg::SS | Reg::DS | Reg::FS | Reg::GS => st.seg[r as usize - Reg::ES as usize] = v & 0xffff,
             _ => st.gpr[r as usize] = v,
         }
     }

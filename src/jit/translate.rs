@@ -705,10 +705,17 @@ impl Jit {
                     Kind::Leave => tx.leave(insn, fl)?,
                     Kind::RdBase(off) => tx.rd_base(insn, off)?,
                     Kind::WrBase(off) => tx.wr_base(insn, off)?,
-                    Kind::Interp => {
+                    Kind::Interp | Kind::InterpEnd => {
                         let idx = tx.interp.len() as u64;
                         tx.interp.push(*insn);
                         tx.hook_call(KIND_INTERP, 0, 0, EaSrc::Imm(idx), Resume::Imm(ip))?;
+                        if matches!(k, Kind::InterpEnd) {
+                            tx.chain(next, false)?;
+                        }
+                    }
+                    Kind::TxAbort(t) => {
+                        tx.a.mov_ri(Register::RAX, 0)?;
+                        tx.chain(t, t <= ip)?;
                     }
                     Kind::Jmp(t) => tx.chain(t, t <= ip)?,
                     Kind::Jcc(t) => {
