@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+*.pdb
+
+__pycache__/
+*.py[cod]
+
+*.jsonl
+*.bin
+*.calls
+*.log
+
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
