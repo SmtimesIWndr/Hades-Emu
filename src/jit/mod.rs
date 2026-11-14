@@ -71,6 +71,7 @@ pub struct TxCfg<'a> {
     pub block_hook: &'a dyn Fn(u64) -> bool,
     pub mem_read_hooks: bool,
     pub mem_write_hooks: bool,
+    pub insn_hooks: u8,
 }
 
 pub struct Jit {

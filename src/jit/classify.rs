@@ -203,6 +203,16 @@ pub fn classify(i: &Instruction, f: &mut InstructionInfoFactory) -> Kind {
     }
 }
 
+pub(super) fn insn_hook_bit(i: &Instruction) -> u8 {
+    use crate::hooks::{INSN_CPUID, INSN_RAND, INSN_RDTSC};
+    match i.mnemonic() {
+        Mnemonic::Cpuid => INSN_CPUID,
+        Mnemonic::Rdtsc | Mnemonic::Rdtscp => INSN_RDTSC,
+        Mnemonic::Rdrand | Mnemonic::Rdseed => INSN_RAND,
+        _ => 0,
+    }
+}
+
 pub(super) fn flags_effect(i: &Instruction) -> (u32, u32) {
     use Mnemonic as M;
     let read = i.rflags_read() & ARITH;

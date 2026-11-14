@@ -1,4 +1,4 @@
-use super::classify::{flags_effect, mem_op_index};
+use super::classify::{flags_effect, insn_hook_bit, mem_op_index};
 use super::*;
 use crate::jit::asm::{AResult, Asm, mem};
 use crate::jit::regs::*;
@@ -635,7 +635,10 @@ impl Jit {
                     insns.push((insn, Kind::Exception(crate::EXC_INVALID_OPCODE), &win[off..off]));
                     break;
                 }
-                let k = classify(&insn, &mut info);
+                let mut k = classify(&insn, &mut info);
+                if cfg.insn_hooks & insn_hook_bit(&insn) != 0 && matches!(k, Kind::Generic) {
+                    k = Kind::Interp;
+                }
                 let off = (ip - rip) as usize;
                 insns.push((insn, k, &win[off..off + insn.len()]));
                 if k.terminates() {

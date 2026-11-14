@@ -1111,3 +1111,185 @@ fn register_addressed_stores_use_guest_memory() {
         assert_eq!(r.unwrap_err(), exc(EXC_INVALID_OPCODE, find(&code, iced_x86::Mnemonic::Clzero, 0)));
     }
 }
+
+
+#[test]
+fn cpuid_rdtsc_rdrand_hooks_override_host_values() {
+    let code = assemble(|a| {
+        a.xor(eax, eax)?;
+        a.xor(ecx, ecx)?;
+        a.cpuid()?;
+        a.mov(r8, rbx)?;
+        a.mov(r9, rdx)?;
+        a.mov(r10, rcx)?;
+        a.mov(eax, 1)?;
+        a.cpuid()?;
+        a.mov(r11, rax)?;
+        a.rdtsc()?;
+        a.shl(rdx, 32)?;
+        a.or(rax, rdx)?;
+        a.mov(r12, rax)?;
+        a.mov(rsi, -1i64)?;
+        a.rdrand(si)?;
+        a.setc(bl)?;
+        a.rdseed(edi)?;
+        a.setc(bh)?;
+        Ok(())
+    });
+    let mut h = setup(&code);
+    let leaves = Rc::new(RefCell::new(Vec::new()));
+    let l2 = leaves.clone();
+    h.add_cpuid_hook(move |_, leaf, sub| {
+        l2.borrow_mut().push((leaf, sub));
+        (leaf == 0).then_some([0xD, u32::from_le_bytes(*b"Genu"), u32::from_le_bytes(*b"ntel"), u32::from_le_bytes(*b"ineI")])
+    });
+    h.add_rdtsc_hook(|_| Some(0x1122_3344_5566_7788));
+    h.add_rdrand_hook(|_, seed, bytes| Some(if seed { 0xAAAA_BBBB_CCCC_DDDD } else { 0x1234 + bytes as u64 }));
+    h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap();
+    assert_eq!(*leaves.borrow(), vec![(0, 0), (1, u32::from_le_bytes(*b"ntel"))]);
+    let vendor: Vec<u8> = [Reg::R8, Reg::R9, Reg::R10].iter().flat_map(|&r| (h.reg_read(r) as u32).to_le_bytes()).collect();
+    assert_eq!(vendor, b"GenuineIntel");
+    assert_eq!(h.reg_read(Reg::R11) as u32, cpuid(1, 0).eax);
+    assert_eq!(h.reg_read(Reg::R12), 0x1122_3344_5566_7788);
+    assert_eq!(h.reg_read(Reg::RSI), 0xFFFF_FFFF_FFFF_1236);
+    assert_eq!(h.reg_read(Reg::RDI), 0xCCCC_DDDD);
+    assert_eq!(h.reg_read(Reg::RBX) & 0xFFFF, 0x0101);
+}
+
+#[test]
+fn deleting_cpuid_hook_restores_host_values() {
+    let code = assemble(|a| {
+        a.xor(eax, eax)?;
+        a.cpuid()?;
+        Ok(())
+    });
+    let mut h = setup(&code);
+    let id = h.add_cpuid_hook(|_, _, _| Some([1, 2, 3, 4]));
+    h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap();
+    assert_eq!(h.reg_read(Reg::RBX), 2);
+    h.hook_del(id);
+    h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap();
+    assert_eq!(h.reg_read(Reg::RBX) as u32, cpuid(0, 0).ebx);
+}
+
+#[test]
+fn context_save_restore_covers_gprs_flags_and_vector_state() {
+    let code = assemble(|a| {
+        a.mov(rbx, DATA)?;
+        a.add(rax, 1)?;
+        a.vmovdqu(ymm3, ymmword_ptr(rbx))?;
+        a.vpaddd(ymm3, ymm3, ymm3)?;
+        a.vmovdqu(ymmword_ptr(rbx), ymm3)?;
+        a.stc()?;
+        Ok(())
+    });
+    let mut h = setup(&code);
+    h.mem_write(DATA, &[1; 32]).unwrap();
+    h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap();
+    let ctx = h.context_save();
+    let rflags = h.reg_read(Reg::RFLAGS);
+    h.emu_start(CODE + 10, CODE + code.len() as u64, None, 0).unwrap();
+    assert_eq!(h.reg_read(Reg::RAX), 2);
+    h.reg_write(Reg::RFLAGS, 0x202);
+    h.context_restore(&ctx);
+    assert_eq!(h.reg_read(Reg::RAX), 1);
+    assert_eq!(h.reg_read(Reg::RFLAGS), rflags);
+    let probe = assemble(|a| {
+        a.mov(rbx, DATA + 0x100)?;
+        a.vmovdqu(ymmword_ptr(rbx), ymm3)?;
+        Ok(())
+    });
+    h.mem_write(CODE + 0x1000, &probe).unwrap();
+    h.emu_start(CODE + 0x1000, CODE + 0x1000 + probe.len() as u64, None, 0).unwrap();
+    assert_eq!(h.mem_read_vec(DATA + 0x100, 32).unwrap(), vec![2; 32]);
+}
+
+fn snapshot_code() -> Vec<u8> {
+    assemble(|a| {
+        a.mov(rbx, DATA)?;
+        a.add(qword_ptr(rbx), 1)?;
+        a.lea(rdi, ptr(rbx + 0x2000))?;
+        a.mov(ecx, 0x1800)?;
+        a.mov(al, 0x5A)?;
+        a.rep().stosb()?;
+        a.mov(rdx, CODE)?;
+        a.mov(byte_ptr(rdx + 0x800), 0xC3)?;
+        a.inc(r12)?;
+        Ok(())
+    })
+}
+
+#[test]
+fn snapshot_restore_rewinds_memory_registers_and_code() {
+    let code = snapshot_code();
+    let mut h = setup(&code);
+    h.mem_write(CODE + 0x800, &[0x90]).unwrap();
+    h.reg_write(Reg::R12, 7);
+    let snap = h.snapshot();
+    let before = h.mem_read_vec(DATA, 0x4000).unwrap();
+    for _ in 0..3 {
+        h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap();
+        h.mem_write(DATA + 0x8000, &[9; 16]).unwrap();
+        assert_eq!(h.reg_read(Reg::R12), 8);
+        assert_eq!(h.mem_read_vec(DATA, 1).unwrap(), [1]);
+        h.snapshot_restore(&snap).unwrap();
+        assert_eq!(h.reg_read(Reg::R12), 7);
+        assert_eq!(h.mem_read_vec(DATA, 0x4000).unwrap(), before);
+        assert_eq!(h.mem_read_vec(DATA + 0x8000, 16).unwrap(), [0; 16]);
+        assert_eq!(h.mem_read_vec(CODE + 0x800, 1).unwrap(), [0x90]);
+    }
+}
+
+#[test]
+fn snapshot_restore_undoes_mappings_and_older_snapshots_still_work() {
+    let code = snapshot_code();
+    let mut h = setup(&code);
+    let first = h.snapshot();
+    let regions = h.mem_regions();
+    h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap();
+    let second = h.snapshot();
+    h.mem_map(0x5000_0000, 0x1000, PERM_READ).unwrap();
+    h.mem_protect(DATA, 0x1000, PERM_READ).unwrap();
+    h.snapshot_restore(&first).unwrap();
+    assert_eq!(h.mem_regions(), regions);
+    assert_eq!(h.mem_read_vec(DATA, 1).unwrap(), [0]);
+    h.snapshot_restore(&second).unwrap();
+    assert_eq!(h.mem_read_vec(DATA, 1).unwrap(), [1]);
+    h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap();
+    assert_eq!(h.mem_read_vec(DATA, 1).unwrap(), [2]);
+}
+
+#[test]
+fn snapshot_restore_from_hook_rewinds_running_guest() {
+    let code = assemble(|a| {
+        a.mov(rbx, DATA)?;
+        a.nop()?;
+        a.add(qword_ptr(rbx), 1)?;
+        a.inc(rsi)?;
+        a.nop()?;
+        Ok(())
+    });
+    let mut h = setup(&code);
+    let start = find(&code, iced_x86::Mnemonic::Nop, 0);
+    let end = find(&code, iced_x86::Mnemonic::Nop, 1);
+    let snap: Rc<RefCell<Option<Snapshot>>> = Rc::new(RefCell::new(None));
+    let rewinds = Rc::new(RefCell::new(0));
+    let (s1, s2, r2) = (snap.clone(), snap.clone(), rewinds.clone());
+    h.add_code_hook(start, start, move |e, _, _| {
+        if s1.borrow().is_none() {
+            *s1.borrow_mut() = Some(e.snapshot());
+        }
+    });
+    h.add_code_hook(end, end, move |e, _, _| {
+        if *r2.borrow() < 5 {
+            *r2.borrow_mut() += 1;
+            e.snapshot_restore(s2.borrow().as_ref().unwrap()).unwrap();
+            e.reg_write(Reg::RCX, e.reg_read(Reg::RCX) + 1);
+        }
+    });
+    h.emu_start(CODE, CODE + code.len() as u64, None, 0).unwrap();
+    assert_eq!(*rewinds.borrow(), 5);
+    assert_eq!(h.mem_read_vec(DATA, 1).unwrap(), [1]);
+    assert_eq!(h.reg_read(Reg::RSI), 1);
+    assert_eq!(h.reg_read(Reg::RCX), 1);
+}

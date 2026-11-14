@@ -34,6 +34,10 @@ pub struct Cpu {
     pub xsavec: bool,
     pub null_sel_clears_base: bool,
     pub cache_line: u64,
+    pub rdrand: bool,
+    pub rdseed: bool,
+    pub rdtscp: bool,
+    pub xsave_size: usize,
     pub mxcsr_mask: u32,
     pub xcomp: [XComponent; 64],
 }
@@ -67,7 +71,7 @@ impl Cpu {
         let l7 = if max >= 7 { __cpuid_count(7, 0) } else { __cpuid_count(0, 0) };
         let has7 = max >= 7;
         let ext_max = __cpuid(0x8000_0000).eax;
-        let e1 = if ext_max >= 0x8000_0001 { __cpuid(0x8000_0001).ecx } else { 0 };
+        let (e1, e1d) = if ext_max >= 0x8000_0001 { (__cpuid(0x8000_0001).ecx, __cpuid(0x8000_0001).edx) } else { (0, 0) };
         let e8 = if ext_max >= 0x8000_0008 { __cpuid(0x8000_0008).ebx } else { 0 };
         let e21 = if ext_max >= 0x8000_0021 { __cpuid(0x8000_0021).eax } else { 0 };
         let osxsave = bit(l1.ecx, 27);
@@ -102,6 +106,10 @@ impl Cpu {
             null_sel_clears_base: vendor == Vendor::Amd && bit(e21, 6),
             cache_line: (((l1.ebx >> 8) & 0xff) as u64 * 8).max(64),
             mxcsr_mask: mxcsr_mask(),
+            rdrand: bit(l1.ecx, 30),
+            rdseed: has7 && bit(l7.ebx, 18),
+            rdtscp: bit(e1d, 27),
+            xsave_size: if max >= 0xD { __cpuid_count(0xD, 0).ebx as usize } else { 576 },
             xcomp,
         }
     }

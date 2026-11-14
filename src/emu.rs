@@ -59,6 +59,8 @@ pub struct Emu {
     pub(crate) counted: bool,
     pub(crate) until: Option<u64>,
     pub(crate) panic: Option<Box<dyn std::any::Any + Send>>,
+    pub(crate) snap: Option<crate::snapshot::Track>,
+    pub(crate) layout_gen: u64,
 }
 
 pub struct Hades {
@@ -94,12 +96,14 @@ impl Emu {
 
     pub fn mem_map(&mut self, addr: u64, size: u64, perms: u8) -> Result<(), EmuError> {
         self.mem.map(addr, size, perms)?;
+        self.layout_gen += 1;
         self.tlb_flush();
         Ok(())
     }
 
     pub fn mem_unmap(&mut self, addr: u64, size: u64) -> Result<(), EmuError> {
         self.mem.unmap(addr, size)?;
+        self.layout_gen += 1;
         self.jit.invalidate_range(addr, addr + size);
         self.tlb_flush();
         Ok(())
@@ -107,6 +111,7 @@ impl Emu {
 
     pub fn mem_protect(&mut self, addr: u64, size: u64, perms: u8) -> Result<(), EmuError> {
         self.mem.protect(addr, size, perms)?;
+        self.layout_gen += 1;
         if perms & PERM_EXEC == 0 {
             self.jit.invalidate_range(addr, addr + size);
         }
@@ -141,6 +146,7 @@ impl Emu {
             rip: self.st().rip,
         })?;
         self.jit.invalidate_range(addr, addr + data.len() as u64);
+        self.mark_dirty(addr, data.len() as u64);
         Ok(())
     }
 

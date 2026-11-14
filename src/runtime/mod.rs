@@ -1,11 +1,12 @@
 pub mod interp;
 mod interp_seg;
+mod interp_sys;
 mod interp_vec;
 pub mod region;
 pub mod state;
 mod trampolines;
 pub mod veh;
-mod xstate;
+pub(crate) mod xstate;
 
 use crate::hooks::HookCb;
 use crate::jit::asm::{Asm, AsmError, patch_rel32};
@@ -48,6 +49,8 @@ impl Emu {
             counted: false,
             until: None,
             panic: None,
+            snap: None,
+            layout_gen: 0,
         });
         let emu_ptr = &mut *emu as *mut Emu as u64;
         let (tlb, jc) = (emu.jit.tlb, emu.jit.jc);
@@ -86,7 +89,7 @@ impl Emu {
         }
     }
 
-    fn tlb_drop_write(&mut self, page: u64) {
+    pub(crate) fn tlb_drop_write(&mut self, page: u64) {
         let i = ((page >> 12) as usize) & (TLB_ENTRIES - 1);
         let e = self.tlb_entry(i);
         let inv = tlb_invalid_tag(i);
@@ -122,23 +125,34 @@ impl Emu {
                 }
                 p += PAGE;
             }
+            self.mark_dirty(ea, size);
         }
         Ok(host)
+    }
+
+    pub(crate) fn mark_dirty(&mut self, addr: u64, size: u64) {
+        if let Some(t) = self.snap.as_mut() {
+            let mut p = addr & !(PAGE - 1);
+            while p < addr + size {
+                t.dirty.insert(p);
+                p += PAGE;
+            }
+        }
     }
 
     fn tlb_fill(&mut self, ea: u64, size: u64, acc: u64) -> Result<*mut u8, Fault> {
         let host = self.access(ea, size, acc)?;
         let page = ea & !(PAGE - 1);
         let perm = self.mem.find(page).map(|r| r.perm_at(page)).unwrap_or(0);
-        let code = self.jit.has_code(page);
+        let no_write = self.jit.has_code(page) || self.snap.as_ref().is_some_and(|t| !t.dirty.contains(&page));
         let i = ((page >> 12) as usize) & (TLB_ENTRIES - 1);
         let inv = tlb_invalid_tag(i);
         let e = self.tlb_entry(i);
         let rw = PERM_READ | PERM_WRITE;
         unsafe {
             *e = if perm & PERM_READ != 0 { page } else { inv };
-            *e.add(1) = if perm & PERM_WRITE != 0 && !code { page } else { inv };
-            *e.add(2) = if perm & rw == rw && !code { page } else { inv };
+            *e.add(1) = if perm & PERM_WRITE != 0 && !no_write { page } else { inv };
+            *e.add(2) = if perm & rw == rw && !no_write { page } else { inv };
             *e.add(3) = host as u64 - (ea - page);
         }
         Ok(host)
@@ -343,6 +357,7 @@ impl Emu {
                 block_hook: &block_hook,
                 mem_read_hooks: mem_r,
                 mem_write_hooks: mem_w,
+                insn_hooks: self.insn_hook_mask(),
             };
             match self.jit.translate(&self.mem, rip, &cfg) {
                 Ok(id) => {
@@ -484,6 +499,7 @@ impl Emu {
                 self.region.run_flag().store(0, Ordering::SeqCst);
             }
             self.enter(host);
+            self.st_mut().ext_light = 0;
             if single && !self.stop_requested.load(Ordering::SeqCst) && !timed_out.load(Ordering::SeqCst) {
                 self.region.run_flag().store(1, Ordering::SeqCst);
             }

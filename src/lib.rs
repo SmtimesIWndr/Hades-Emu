@@ -8,8 +8,10 @@ mod hooks;
 mod jit;
 mod memory;
 mod runtime;
+mod snapshot;
 
 pub use emu::*;
 pub use error::{EmuError, MemAccess};
 pub use hooks::{HOOK_MEM_READ, HOOK_MEM_WRITE, HookId};
+pub use snapshot::{Context, Snapshot};
 pub use memory::{PERM_EXEC, PERM_READ, PERM_WRITE};

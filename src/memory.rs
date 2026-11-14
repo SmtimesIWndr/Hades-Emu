@@ -60,6 +60,12 @@ pub enum MapError {
     NotMapped,
 }
 
+pub(crate) struct RegionImage {
+    pub(crate) base: u64,
+    perms: Vec<u8>,
+    pub(crate) data: Vec<u8>,
+}
+
 #[derive(Default)]
 pub struct Memory {
     regions: BTreeMap<u64, Region>,
@@ -83,6 +89,29 @@ impl Memory {
             }
             out
         })
+    }
+
+    pub(crate) fn capture(&self) -> Vec<RegionImage> {
+        self.regions
+            .values()
+            .map(|r| RegionImage {
+                base: r.base,
+                perms: r.perms.clone(),
+                data: unsafe { core::slice::from_raw_parts(r.host.ptr, r.size as usize) }.to_vec(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn restore(&mut self, images: &[RegionImage]) -> Result<(), MapError> {
+        let mut regions = BTreeMap::new();
+        for img in images {
+            let host = HostBuf::new(img.data.len()).ok_or(MapError::NoMemory)?;
+            unsafe { core::ptr::copy_nonoverlapping(img.data.as_ptr(), host.ptr, img.data.len()) };
+            let size = img.data.len() as u64;
+            regions.insert(img.base, Region { base: img.base, size, host, perms: img.perms.clone() });
+        }
+        self.regions = regions;
+        Ok(())
     }
 
     pub fn map(&mut self, addr: u64, size: u64, perms: u8) -> Result<(), MapError> {

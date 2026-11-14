@@ -65,11 +65,18 @@ emu.add_intr_hook(|e, vector| { /* int3, int n, #DE/#UD/#GP from guest code */ }
 emu.add_invalid_mem_hook(|e, access, addr, size, _| {
     e.mem_map(addr & !0xfff, 0x1000, PERM_READ | PERM_WRITE).is_ok() // true = retry the access
 });
+emu.add_cpuid_hook(|e, leaf, subleaf| (leaf == 0).then_some([0xD, ebx, ecx, edx]));
+emu.add_rdtsc_hook(|e| Some(fake_tsc));
+emu.add_rdrand_hook(|e, rdseed, bytes| Some(4));
 
 emu.emu_start(0x140000000, until, Some(Duration::from_secs(5)), 0)?;
 ```
 
 Hooks receive `&mut Emu` and can read and write registers (`reg_*`, `xmm_*`), memory and mappings, change RIP (execution resumes there), or call `emu_stop()`. `stop_handle()` returns a `Send + Sync` handle that stops emulation from another thread.
+
+The `cpuid`, `rdtsc` and `rdrand` hooks return `Some` to replace the result or `None` to use the host value. They also cover `rdtscp` and `rdseed`. Without these hooks the instructions run natively.
+
+`context_save()`/`context_restore()` save and restore all registers including vector state. `snapshot()`/`snapshot_restore()` also save memory and mappings. After a snapshot Hades tracks which pages get written, so restoring the latest snapshot only copies those pages back. Taking a snapshot of 64 MiB takes 29 ms, and running plus restoring a loop that dirties 16 pages takes 2.6 µs. Both can be called from hooks.
 
 Errors are explicit: `EmuError::Memory { access, addr, size, rip }`, `Exception { vector, rip }`, `Interrupt`, `Syscall`, `Unsupported { rip, text }`.
 
@@ -78,6 +85,7 @@ Errors are explicit: `EmuError::Memory { access, addr, size, rip }`, `Exception 
 ```
 src/
   lib.rs              public re-exports
+  snapshot.rs         context and snapshot save/restore
   emu.rs              Hades / Emu API: memory, registers, control
   error.rs            EmuError, MemAccess
   cpu.rs              host CPU features
@@ -95,6 +103,7 @@ src/
     state.rs          CpuState layout shared with generated code
     region.rs         executable region allocation
     interp.rs         string ops, xlat, enter, bt* with memory
+    interp_sys.rs     hooked cpuid, rdtsc, rdrand
     interp_seg.rs     segment loads, far jmp/call/ret, iret, 16 bit pushf/popf
     interp_vec.rs     guest xsave/xrstor, gathers and scatters, maskmov, movdir64b, clzero
     xstate.rs         guest vector registers inside the saved XSAVE area
@@ -117,7 +126,7 @@ tools/                Unicorn counterparts and comparison scripts (Python, needs
 
 ## Verification
 
-- `cargo test`: 39 integration tests covering semantics, hooks, faults, SMC, `until`/count/timeout, TF single stepping, vector-state preservation and system instructions.
+- `cargo test`: 45 integration tests covering semantics, hooks, faults, SMC, `until`/count/timeout, TF single stepping, vector-state preservation, system instructions and snapshots.
 
 - Differential fuzzing against Unicorn, random programs exercising ALU ops, shifts, mul, `lea` with RSP/R15, high byte registers, `xchg`/`xadd`/`cmpxchg`, `setcc`/`cmovcc`, `bt*`, push/pop (including memory forms), `pushfq`/`popfq`, `lahf`/`sahf`, string ops with `std`, forward `jcc`, `call`/`ret`, RIP relative, FS relative and 32 bit addressing, and SSE. The generator tracks architecturally defined flags so it never compares undefined bits. 26,000 programs matched across three codegen modes
 
@@ -130,7 +139,7 @@ tools/                Unicorn counterparts and comparison scripts (Python, needs
 ## Limitations
 
 - Host must be Windows x64 with XSAVE. The guest is 64 bit user mode only.
-- `cpuid`, `rdtsc` and `rdrand` return host values, and guest AVX 512 works only if the host has it.
+- `cpuid`, `rdtsc` and `rdrand` return host values unless hooked, and guest AVX 512 works only if the host has it.
 - Segments follow the Windows x64 GDT. CS is `0x33`, data is `0x2B`, FS is `0x53` and 32 bit code is `0x23`. Bad selectors raise `#GP` like hardware. Far transfers into 32 bit code (Heaven's Gate) return `EmuError::Unsupported`.
 - `sysenter`/`sysexit`/`sysret`, `monitor`/`mwait`, CET shadow stack instructions, `rdpkru`/`wrpkru` and TSX raise the same exception they raise in Windows user mode on the host. `rdssp` and MPX instructions are NOPs. If the host has RTM, `xbegin` always aborts with RAX = 0.
 - Behavior that differs between Intel and AMD follows the host CPU.
